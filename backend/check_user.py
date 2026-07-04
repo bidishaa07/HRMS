@@ -1,6 +1,9 @@
+import asyncio
+
+from sqlalchemy import select
+
 from app.database import SessionLocal
 from app.models import User
-from sqlalchemy import select
 
 
 async def main():
@@ -13,5 +16,4 @@ async def main():
 
 
 if __name__ == '__main__':
-    import asyncio
     asyncio.run(main())
