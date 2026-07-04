@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+:root {
+  --ink: #111318;
+  --muted: #68707d;
+  --line: rgba(17, 19, 24, .08);
+  --surface: rgba(255, 255, 255, .76);
+  --violet: #765cf4;
+  --mint: #47c6a4;
+}
+
+* { box-sizing: border-box; }
+html { background: #f4f5f8; }
+body {
+  margin: 0;
+  color: var(--ink);
+  font-family: "Geist", "Geist Fallback", ui-sans-serif, system-ui, sans-serif;
+  background:
+    radial-gradient(circle at 75% -10%, rgba(151, 123, 255, .15), transparent 35%),
+    radial-gradient(circle at 5% 70%, rgba(71, 198, 164, .10), transparent 30%),
+    #f4f5f8;
+}
+button, input { font: inherit; }
+button { cursor: pointer; }
+button:focus-visible, input:focus-visible { outline: 2px solid #765cf4; outline-offset: 2px; }
+.glass { background: var(--surface); border: 1px solid rgba(255,255,255,.85); box-shadow: 0 18px 45px rgba(30, 34, 45, .06); backdrop-filter: blur(24px); }
+.mono { font-family: "Geist Mono", "Geist Mono Fallback", ui-monospace, monospace; }
+.scrollbar-none::-webkit-scrollbar { display: none; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+

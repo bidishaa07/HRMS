@@ -1,0 +1,7 @@
+AURORA HR
+The Autonomous AI Workforce Operating System
+
+Run locally: docker compose up --build
+Web: http://localhost:3000
+API docs: http://localhost:8000/docs
+
