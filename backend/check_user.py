@@ -1,7 +1,7 @@
-import asyncio
 from app.database import SessionLocal
 from app.models import User
 from sqlalchemy import select
+
 
 async def main():
     async with SessionLocal() as db:
@@ -11,5 +11,7 @@ async def main():
         else:
             print("User does not exist")
 
+
 if __name__ == '__main__':
+    import asyncio
     asyncio.run(main())
