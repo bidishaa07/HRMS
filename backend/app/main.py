@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -8,7 +9,7 @@ from typing import Annotated
 from uuid import UUID, uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -33,8 +34,18 @@ from .models import (
     Payroll,
     User,
 )
+from .realtime import authenticate_websocket, dispatcher_loop, manager, stop_dispatcher, wake_dispatcher
 from .schemas import AgentCommand, AgentResponse
 from .security import hash_password
+from .services import (
+    check_in as check_in_service,
+    check_out as check_out_service,
+    create_employee as create_employee_service,
+    create_leave as create_leave_service,
+    deactivate_employee as deactivate_employee_service,
+    decide_leave as decide_leave_service,
+    update_employee as update_employee_service,
+)
 from .seed import seed_database
 
 DbSession = Annotated[AsyncSession, Depends(get_db)]
@@ -46,9 +57,12 @@ async def lifespan(_: FastAPI):
     await create_schema()
     async with SessionLocal() as db:
         await seed_database(db)
+    stop_event = asyncio.Event()
+    dispatcher = asyncio.create_task(dispatcher_loop(stop_event))
     try:
         yield
     finally:
+        await stop_dispatcher(dispatcher, stop_event)
         await close_database()
 
 
@@ -68,6 +82,23 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
 app.include_router(auth_router)
+
+
+@app.websocket("/api/v1/realtime/ws")
+async def realtime_websocket(websocket: WebSocket) -> None:
+    async with SessionLocal() as db:
+        user = await authenticate_websocket(websocket, db)
+        if not user:
+            await websocket.close(code=4401, reason="Authentication required")
+            return
+        await manager.connect(websocket, user)
+        try:
+            while True:
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            await manager.disconnect(websocket)
+        except Exception:
+            await manager.disconnect(websocket)
 
 
 @app.middleware("http")
@@ -111,7 +142,7 @@ def employee_json(employee: Employee, attendance: Attendance | None = None) -> d
         "profile_completion": employee.profile_completion,
         "health_score": employee.health_score,
         "salary": float(employee.salary),
-        "status": attendance.status if attendance else "absent",
+        "status": "inactive" if not user.is_active else attendance.status if attendance else "absent",
         "check_in": attendance.check_in.isoformat() if attendance and attendance.check_in else None,
         "check_out": attendance.check_out.isoformat() if attendance and attendance.check_out else None,
     }
@@ -185,16 +216,28 @@ class EmployeeCreate(BaseModel):
     joining_date: date = Field(default_factory=date.today)
 
 
+class EmployeeUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=160)
+    email: str | None = None
+    phone: str | None = None
+    department: str | None = None
+    title: str | None = None
+    salary: Decimal | None = Field(default=None, ge=0)
+    joining_date: date | None = None
+
+
 @app.get("/api/v1/employees", tags=["employees"])
 async def list_employees(
     db: DbSession,
-    _: CurrentUser,
+    user: CurrentUser,
     search: str = "",
     department: str | None = None,
     offset: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=100),
 ) -> list[dict]:
     query = select(Employee).options(selectinload(Employee.user), selectinload(Employee.department)).join(User)
+    if user.role == "employee":
+        query = query.where(Employee.user_id == user.id)
     if search:
         pattern = f"%{search.lower()}%"
         query = query.where(
@@ -227,40 +270,23 @@ async def list_employees(
 
 @app.post("/api/v1/employees", status_code=201, tags=["employees"])
 async def create_employee(payload: EmployeeCreate, db: DbSession, actor: AdminOnly) -> dict:
-    if await db.scalar(select(User).where(func.lower(User.email) == payload.email.lower())):
-        raise HTTPException(status_code=409, detail="An employee already exists for this email")
-    department = await db.scalar(select(Department).where(func.lower(Department.name) == payload.department.lower()))
-    if not department:
-        department = Department(name=payload.department)
-        db.add(department)
-        await db.flush()
-    login_id = await generate_login_id(db, actor.company_name, payload.name, payload.joining_date.year)
-    user = User(
-        email=payload.email.lower(),
-        login_id=login_id,
-        name=payload.name,
-        company_name=actor.company_name,
-        phone=payload.phone,
-        password_hash=hash_password("Welcome@123"),
-        role="employee",
-    )
-    db.add(user)
-    await db.flush()
-    employee = Employee(
-        user_id=user.id,
-        employee_code=login_id,
-        department_id=department.id,
-        title=payload.title,
-        salary=payload.salary,
-        joining_date=payload.joining_date,
-        profile_completion=75,
-    )
-    db.add(employee)
-    await db.flush()
-    audit(db, actor, "employee.create", "employee", employee.id)
-    await db.commit()
-    await db.refresh(employee, ["user", "department"])
-    return {**employee_json(employee), "temporary_password": "Welcome@123"}
+    employee, temporary_password = await create_employee_service(db, actor=actor, payload=payload.model_dump())
+    wake_dispatcher()
+    return {**employee_json(employee), "temporary_password": temporary_password}
+
+
+@app.patch("/api/v1/employees/{employee_id}", tags=["employees"])
+async def update_employee(employee_id: UUID, payload: EmployeeUpdate, db: DbSession, actor: AdminOnly) -> dict:
+    employee = await update_employee_service(db, actor=actor, employee_id=employee_id, payload=payload.model_dump(exclude_none=True))
+    wake_dispatcher()
+    return employee_json(employee)
+
+
+@app.patch("/api/v1/employees/{employee_id}/deactivate", tags=["employees"])
+async def deactivate_employee(employee_id: UUID, db: DbSession, actor: AdminOnly) -> dict:
+    employee = await deactivate_employee_service(db, actor=actor, employee_id=employee_id)
+    wake_dispatcher()
+    return {"id": str(employee.id), "status": "inactive"}
 
 
 @app.get("/api/v1/attendance", tags=["attendance"])
@@ -303,40 +329,16 @@ async def attendance_list(
 
 @app.post("/api/v1/attendance/check-in", tags=["attendance"])
 async def check_in(db: DbSession, user: CurrentUser) -> dict:
-    employee = await current_employee(db, user)
-    today = date.today()
-    existing = await db.scalar(
-        select(Attendance).where(Attendance.employee_id == employee.id, Attendance.work_date == today)
-    )
-    if existing and existing.check_in:
-        raise HTTPException(status_code=409, detail="You are already checked in today")
-    now = datetime.now(UTC)
-    row = existing or Attendance(employee_id=employee.id, work_date=today)
-    row.check_in = now
-    row.status = "late" if (now.hour, now.minute) > (9, 30) else "present"
-    db.add(row)
-    audit(db, user, "attendance.check_in", "attendance", row.id)
-    await db.commit()
-    return {"message": "Checked in successfully", "check_in": now.isoformat(), "status": row.status}
+    row, check_in_value, status = await check_in_service(db, actor=user)
+    wake_dispatcher()
+    return {"message": "Checked in successfully", "check_in": check_in_value, "status": status}
 
 
 @app.post("/api/v1/attendance/check-out", tags=["attendance"])
 async def check_out(db: DbSession, user: CurrentUser) -> dict:
-    employee = await current_employee(db, user)
-    row = await db.scalar(
-        select(Attendance).where(Attendance.employee_id == employee.id, Attendance.work_date == date.today())
-    )
-    if not row or not row.check_in:
-        raise HTTPException(status_code=409, detail="Check in before checking out")
-    if row.check_out:
-        raise HTTPException(status_code=409, detail="You are already checked out today")
-    now = datetime.now(UTC)
-    check_in_value = row.check_in.replace(tzinfo=UTC) if row.check_in.tzinfo is None else row.check_in
-    row.check_out = now
-    row.work_minutes = max(0, int((now - check_in_value).total_seconds() / 60))
-    audit(db, user, "attendance.check_out", "attendance", row.id)
-    await db.commit()
-    return {"message": "Checked out successfully", "check_out": now.isoformat(), "work_minutes": row.work_minutes}
+    row, check_out_value = await check_out_service(db, actor=user)
+    wake_dispatcher()
+    return {"message": "Checked out successfully", "check_out": check_out_value, "work_minutes": row.work_minutes}
 
 
 class LeaveCreate(BaseModel):
@@ -380,50 +382,21 @@ async def list_leaves(db: DbSession, user: CurrentUser, state: str | None = None
 
 @app.post("/api/v1/leaves", status_code=201, tags=["leave"])
 async def apply_leave(payload: LeaveCreate, db: DbSession, user: CurrentUser) -> dict:
-    if payload.end_date < payload.start_date:
-        raise HTTPException(status_code=422, detail="End date cannot be before start date")
-    employee = await current_employee(db, user)
-    conflict = await db.scalar(
-        select(LeaveRequest).where(
-            LeaveRequest.employee_id == employee.id,
-            LeaveRequest.status.in_(["pending", "approved"]),
-            LeaveRequest.start_date <= payload.end_date,
-            LeaveRequest.end_date >= payload.start_date,
-        )
-    )
-    if conflict:
-        raise HTTPException(status_code=409, detail="This request overlaps an existing leave request")
-    row = LeaveRequest(employee_id=employee.id, **payload.model_dump())
-    db.add(row)
-    await db.flush()
-    audit(db, user, "leave.apply", "leave_request", row.id)
-    await db.commit()
-    await db.refresh(row, ["employee"])
-    await db.refresh(row.employee, ["user"])
+    row = await create_leave_service(db, actor=user, **payload.model_dump())
+    wake_dispatcher()
     return leave_json(row)
 
 
 @app.patch("/api/v1/leaves/{leave_id}", tags=["leave"])
 async def decide_leave(leave_id: UUID, payload: LeaveDecision, db: DbSession, actor: AdminOnly) -> dict:
-    row = await db.scalar(
-        select(LeaveRequest)
-        .options(selectinload(LeaveRequest.employee).selectinload(Employee.user))
-        .where(LeaveRequest.id == leave_id)
+    row = await decide_leave_service(
+        db,
+        actor=actor,
+        leave_id=leave_id,
+        decision=payload.decision,
+        comment=payload.comment,
     )
-    if not row:
-        raise HTTPException(status_code=404, detail="Leave request not found")
-    row.status = payload.decision
-    row.approver_id = actor.id
-    row.approver_comment = payload.comment
-    db.add(
-        Notification(
-            user_id=row.employee.user_id,
-            title=f"Leave {payload.decision}",
-            body=f"Your {row.leave_type.lower()} leave request was {payload.decision}.",
-        )
-    )
-    audit(db, actor, f"leave.{payload.decision}", "leave_request", row.id)
-    await db.commit()
+    wake_dispatcher()
     return leave_json(row)
 
 
@@ -623,7 +596,8 @@ async def upload_document(
     filename = Path(file.filename or "document").name
     suffix = Path(filename).suffix.lower()
     object_key = f"{uuid4()}{suffix}"
-    (upload_dir / object_key).write_bytes(content)
+    file_path = upload_dir / object_key
+    file_path.write_bytes(content)
     row = Document(
         employee_id=employee.id,
         name=filename,
@@ -631,10 +605,15 @@ async def upload_document(
         object_key=object_key,
         mime_type=file.content_type or "application/octet-stream",
     )
-    db.add(row)
-    await db.flush()
-    audit(db, user, "document.upload", "document", row.id)
-    await db.commit()
+    try:
+        db.add(row)
+        await db.flush()
+        audit(db, user, "document.upload", "document", row.id)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        file_path.unlink(missing_ok=True)
+        raise
     return {
         "id": str(row.id),
         "name": row.name,

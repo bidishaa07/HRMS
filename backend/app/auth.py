@@ -255,7 +255,7 @@ async def refresh_session(
 
 
 @router.post("/logout", status_code=204)
-async def logout(response: Response, db: DbSession, request: Request) -> Response:
+async def logout(response: Response, db: DbSession, request: Request) -> None:
     token = request.cookies.get("aurora_access")
     user_id = None
     if token:
@@ -271,7 +271,6 @@ async def logout(response: Response, db: DbSession, request: Request) -> Respons
             db.add(AuditLog(actor_id=user.id, action="auth.logout", entity_type="user", entity_id=user.id))
             await db.commit()
     clear_session_cookies(response)
-    return response
 
 
 OAUTH = {

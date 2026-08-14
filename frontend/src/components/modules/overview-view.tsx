@@ -1,25 +1,23 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { ArrowRight, Bot, CalendarDays, Check, HeartPulse, Loader2, Sparkles, Users, WalletCards } from "lucide-react";
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { api, type Employee, type Summary, type User } from "@/lib/api";
+import { api, type User } from "@/lib/api";
+import { useRealtime } from "@/lib/realtime";
 import { Modal } from "../modal";
 import { Card, Pill } from "../ui";
 
 const trend = [{ day: "Mon", present: 42 }, { day: "Tue", present: 45 }, { day: "Wed", present: 44 }, { day: "Thu", present: 41 }, { day: "Fri", present: 43 }];
 
 export function OverviewView({ onNavigate }: { user: User; onNavigate: (item: string) => void }) {
-  const [summary, setSummary] = useState<Summary | null>(null);
-  const [people, setPeople] = useState<Employee[]>([]);
+  const summaryQuery = useQuery({ queryKey: ["dashboard-summary"], queryFn: api.summary });
+  const peopleQuery = useQuery({ queryKey: ["employees", ""], queryFn: () => api.employees() });
+  useRealtime();
+  const summary = summaryQuery.data;
+  const people = (peopleQuery.data ?? []).slice(0, 5);
   const [selectedMetric, setSelectedMetric] = useState<{ label: string; value: string | number; note: string } | null>(null);
-
-  useEffect(() => {
-    Promise.all([api.summary(), api.employees()]).then(([nextSummary, nextPeople]) => {
-      setSummary(nextSummary);
-      setPeople(nextPeople.slice(0, 5));
-    });
-  }, []);
 
   if (!summary) return <div className="grid h-[60vh] place-items-center"><Loader2 className="animate-spin text-violet-600" /></div>;
 

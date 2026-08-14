@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from uuid import uuid4
 
 import httpx
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
+from .database import SessionLocal
 from .demo import employees, leave_requests
+from .models import Attendance, Document, Employee, LeaveRequest, Payroll, User
 from .schemas import AgentResponse
 
 
@@ -34,6 +39,9 @@ AGENTS = (
     AgentDefinition(
         "Resume Intelligence Agent", "Resume extraction and profile completion", ("extract_resume", "update_profile")
     ),
+    AgentDefinition(
+        "Document/Onboarding Agent", "Document readiness and onboarding records", ("get_documents", "get_employee_records")
+    ),
 )
 
 
@@ -46,6 +54,9 @@ class AgentOrchestrator:
 
     async def run(self, command: str) -> AgentResponse:
         routed = self._route(command)
+        targeted = await self._run_database_intent(routed, command)
+        if targeted:
+            return targeted
         try:
             result = await self._run_openrouter(routed, command)
             return AgentResponse(
@@ -67,6 +78,96 @@ class AgentOrchestrator:
                 )
             except Exception:
                 return self._fallback(routed, command)
+
+    async def _run_database_intent(self, definition: AgentDefinition, command: str) -> AgentResponse | None:
+        lowered = command.lower()
+        if "absent" in lowered:
+            message = await self._absent_today()
+            tools = ["get_attendance"]
+        elif "on leave" in lowered and ("today" in lowered or "now" in lowered):
+            message = await self._on_leave_today()
+            definition = AGENTS[2]
+            tools = ["get_approved_leave"]
+        elif definition.name == "Payroll Agent" and any(word in lowered for word in ("anomal", "issue", "problem")):
+            message = await self._payroll_anomalies()
+            tools = ["get_payroll"]
+        elif definition.name == "Document/Onboarding Agent" and any(word in lowered for word in ("attention", "missing", "expir")):
+            message = await self._documents_needing_attention()
+            tools = ["get_documents"]
+        else:
+            return None
+        return AgentResponse(
+            message=message,
+            agent=definition.name,
+            tools_used=tools,
+            explainability="Routed to a database-backed specialist tool; response contains only records currently stored in Aurora HR.",
+            task_id=uuid4(),
+        )
+
+    @staticmethod
+    async def _absent_today() -> str:
+        today = date.today()
+        async with SessionLocal() as db:
+            active = list((await db.scalars(
+                select(Employee).join(User).options(selectinload(Employee.user)).where(User.is_active.is_(True))
+            )).all())
+            checked_in = set((await db.scalars(
+                select(Attendance.employee_id).where(Attendance.work_date == today, Attendance.check_in.is_not(None))
+            )).all())
+            on_leave = set((await db.scalars(
+                select(LeaveRequest.employee_id).where(
+                    LeaveRequest.status == "approved",
+                    LeaveRequest.start_date <= today,
+                    LeaveRequest.end_date >= today,
+                )
+            )).all())
+        absent = sorted((employee.user.name for employee in active if employee.id not in checked_in and employee.id not in on_leave), key=str.casefold)
+        if not absent:
+            return "No employees are absent today based on today's attendance records. Approved leave is excluded."
+        return f"{len(absent)} employee(s) are absent today: {', '.join(absent)}. Approved leave is excluded."
+
+    @staticmethod
+    async def _on_leave_today() -> str:
+        today = date.today()
+        async with SessionLocal() as db:
+            requests = list((await db.scalars(
+                select(LeaveRequest).options(selectinload(LeaveRequest.employee).selectinload(Employee.user)).where(
+                    LeaveRequest.status == "approved",
+                    LeaveRequest.start_date <= today,
+                    LeaveRequest.end_date >= today,
+                )
+            )).all())
+        names = sorted((request.employee.user.name for request in requests), key=str.casefold)
+        if not names:
+            return "No approved leave is recorded for today."
+        return f"{len(names)} employee(s) are on approved leave today: {', '.join(names)}."
+
+    @staticmethod
+    async def _payroll_anomalies() -> str:
+        async with SessionLocal() as db:
+            rows = list((await db.scalars(
+                select(Payroll).options(selectinload(Payroll.employee).selectinload(Employee.user))
+            )).all())
+        anomalies = []
+        for row in rows:
+            expected = row.basic + row.bonuses - row.deductions
+            if row.net_salary != expected:
+                anomalies.append(f"{row.employee.user.name} ({row.period})")
+        if not anomalies:
+            return f"No payroll calculation anomalies found across {len(rows)} payroll record(s)."
+        return f"{len(anomalies)} payroll anomaly record(s) found: {', '.join(anomalies[:10])}."
+
+    @staticmethod
+    async def _documents_needing_attention() -> str:
+        async with SessionLocal() as db:
+            rows = list((await db.scalars(
+                select(Document)
+            )).all())
+        missing_extraction = [row for row in rows if not row.extracted_text]
+        if not missing_extraction:
+            return "No document records need attention based on the stored metadata. Expiry tracking is not available in the current document schema."
+        names = sorted((row.name for row in missing_extraction), key=str.casefold)
+        return f"{len(names)} document record(s) need attention because extracted text is missing: {', '.join(names[:10])}. Expiry tracking is not available in the current document schema."
 
     async def _run_openrouter(self, definition: AgentDefinition, command: str) -> str:
         from .config import settings
@@ -175,6 +276,9 @@ class AgentOrchestrator:
             "resume": 9,
             "skills": 9,
             "experience": 9,
+            "document": 10,
+            "documents": 10,
+            "expiring": 10,
         }
         for phrase, index in routes.items():
             if phrase in lowered:

@@ -1,14 +1,48 @@
+# Environment / secrets
 .env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python
 .venv/
+venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+
+# Node / Next.js
 node_modules/
 .next/
 coverage/
+
+# Tests / reports
 htmlcov/
+
+# Logs
 *.log
+
+# Local database
 *.db
-.DS_Store
+
+# Local uploaded/private files
 uploads/
+
+# Browser/test artifacts
+.chrome-logout-test-2/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+
+# Migration backups
+backend/migration_backups/
+
+# TypeScript build info
+*.tsbuildinfo

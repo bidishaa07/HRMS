@@ -24,7 +24,9 @@ class Settings(BaseSettings):
     ollama_host: str = "http://localhost:11434"
     ollama_model_id: str = "qwen2.5:3b"
     cors_origins: str = "http://localhost:3000"
-    model_config = SettingsConfigDict(env_file=("../.env", ".env"), extra="ignore")
+    # Prefer the workspace .env when running from the backend directory so a stale
+    # backend/.env cannot silently override the active deployment database URL.
+    model_config = SettingsConfigDict(env_file=(".env", "../.env"), extra="ignore")
 
     @property
     def allowed_origins(self) -> list[str]:

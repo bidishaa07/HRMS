@@ -1,4 +1,4 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001/api/v1";
+export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/api/v1";
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) { super(message); }
@@ -48,6 +48,8 @@ export const api = {
   summary: () => request<Summary>("/dashboard/summary"),
   employees: (search = "") => request<Employee[]>(`/employees?search=${encodeURIComponent(search)}`),
   createEmployee: (body: { name: string; email: string; phone: string; department: string; title: string; salary: number; joining_date: string }) => request<Employee & { temporary_password: string }>("/employees", { method: "POST", body: JSON.stringify(body) }),
+  updateEmployee: (id: string, body: { name?: string; email?: string; phone?: string; department?: string; title?: string; salary?: number; joining_date?: string }) => request<Employee>(`/employees/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deactivateEmployee: (id: string) => request<{ id: string; status: string }>(`/employees/${id}/deactivate`, { method: "PATCH" }),
   attendance: (month?: string) => request<Attendance[]>(`/attendance${month ? `?month=${month}` : ""}`),
   checkIn: () => request<{ message: string; check_in: string; status: string }>("/attendance/check-in", { method: "POST" }),
   checkOut: () => request<{ message: string; check_out: string; work_minutes: number }>("/attendance/check-out", { method: "POST" }),
